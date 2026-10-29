@@ -36,19 +36,14 @@ from axplan.memory import (
     SPARK_RATE_DEFAULT,
     SPARK_RATE_NEURON,
     BudgetSpec,
-    Codec,
-    CreditModel,
     MemoryPlan,
-    Precision,
     Regime,
     activation_bytes,
     analyse,
     best_codec,
 )
 from axplan.planner import (
-    PartitionPlan,
     Segment,
-    brute_force,
     exact_peak,
     plan_partition,
 )
@@ -79,17 +74,32 @@ try:
     from axtf import HAS_TF as _HAS_TF
     from axtf import TF_ERROR as _TF_ERR
     from axtf import SpikingCell, SpikingRNNCell
-except Exception as _e:                     # pragma: no cover
+except Exception as _e:                     # pragma: no cover  # noqa: BLE001
     # axtf itself failed to import, which is a different fault from TensorFlow
     # being absent. Do not mask it as a missing dependency.
     _HAS_TF = False
     _TF_ERR = str(_e)
+
+# backends -- framework abstraction (lazy: no TF/torch imported here)
+try:
+    from backends import Backend as _Backend
+    from backends import TensorFlowBackend as _TFBackend
+    from backends import TorchBackend as _TorchBackend
+    from backends import get_backend as _get_backend
+    _HAS_BACKENDS = True
+except Exception as _e:                     # pragma: no cover  # noqa: BLE001
+    _HAS_BACKENDS = False
+    _Backend = None
+    _TFBackend = None
+    _TorchBackend = None
+    _get_backend = None
 
 __all__ = [
     "GIB",
     "SPARK_RATE_BAND",
     "SPARK_RATE_DEFAULT",
     "SPARK_RATE_NEURON",
+    "Backend",
     "Budget",
     "BudgetSpec",
     "Candidate",
@@ -101,6 +111,8 @@ __all__ = [
     "SpikingCell",
     "SpikingRNN",
     "SpikingRNNCell",
+    "TensorFlowBackend",
+    "TorchBackend",
     "analyse",
     "best_codec",
     "capacity_frontier",
@@ -108,12 +120,19 @@ __all__ = [
     "exact_peak",
     "explain_budget",
     "gate_report",
+    "get_backend",
     "largest_that_fits",
     "local_quality",
     "plan_partition",
 ]
 
 GIB = 1 << 30
+
+# public aliases for backend classes (may be None if backends unavailable)
+Backend = _Backend
+TensorFlowBackend = _TFBackend
+TorchBackend = _TorchBackend
+get_backend = _get_backend
 
 
 # ═══ MODEL ═══════════════════════════════════════════════════════════════
@@ -223,6 +242,33 @@ class SpikingRNN:
                 f"norm_t={self.norm_t}, k={self.credit_k})")
 
 
+def _gate_suite_count() -> int | None:
+    """How many suites the gate declares, or None if that cannot be read.
+
+    Parsed, not imported: `tests/` is not a package, and `import
+    tests.run_all` binds to whichever unrelated `tests` package sits earlier
+    on sys.path. ast.parse reads the literal without executing the gate.
+    """
+    import ast
+    import os
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "tests", "run_all.py")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+    except (OSError, SyntaxError, ValueError):
+        return None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets
+                     if isinstance(t, ast.Name)]
+            if "SUITES" in names and isinstance(node.value, (ast.List,
+                                                             ast.Tuple)):
+                return len(node.value.elts)
+    return None
+
+
 def _split_layer_kwargs(layer_cls, candidates: dict):
     """Split `candidates` into the names `layer_cls` accepts and the ones it does not.
 
@@ -258,6 +304,10 @@ def _layer_kwargs_help(layer_cls) -> str:
     return ", ".join(names) if names else "(none)"
 
 
+class _UnitsError(ValueError, TypeError):
+    """Raised when add_spiking gets an invalid `units` value."""
+
+
 class Model:
     """Minimal model layer on top of Keras/TF.
 
@@ -270,12 +320,33 @@ class Model:
     (neuron dynamics) and any layer via subclassing are overridable.
     """
 
-    def __init__(self, cell=None, **layer_kw):
+    def __init__(self, cell=None, backend="tensorflow", **layer_kw):
         self.layers: list = []
         self.cell = cell
+        self.backend = backend
+        self._backend = backend
         self.layer_kw = layer_kw
         self._compiled = None
         self._budget: Budget | None = None
+
+    def _resolve_backend(self, backend=None):
+        name = self.backend if backend is None else backend
+        if _get_backend is None:
+            from backends import get_backend as _gb
+            return _gb(name)
+        return _get_backend(name)
+
+    def build(self, backend=None, inputs=None, outputs=None,
+              compile_model=False, readout="flatten"):
+        be = self._resolve_backend(backend)
+        if not getattr(be, "has_backend", lambda: False)():
+            raise RuntimeError(
+                f"Backend {getattr(be, 'name', backend)!r} is not available.")
+        return be.build_model(self, inputs=inputs, outputs=outputs,
+                              compile_model=compile_model, readout=readout)
+
+    def get_backend(self, backend=None):
+        return self._resolve_backend(backend)
 
     # ── construction ────────────────────────────────────────────────────
     def add(self, layer):
@@ -303,6 +374,20 @@ class Model:
         In other words the advertised ability to extend without forking
         simply did not work through the public API.
         """
+        # units must be a positive integer: a width of 0 or a negative
+        # number is a typo, and a float/str is a contract violation. Fail
+        # fast with a clear message instead of letting it reach Keras.
+        import numbers
+        if isinstance(units, bool) or not isinstance(units, (int, numbers.Integral)):
+            raise _UnitsError(
+                f"add_spiking() requires `units` to be a positive int, "
+                f"got {units!r} ({type(units).__name__}).")
+        if int(units) <= 0:
+            raise _UnitsError(
+                f"add_spiking() requires `units` to be a positive int, "
+                f"got {units!r}.")
+        units = int(units)
+
         merged = {**self.layer_kw, **kw}
         # Keep only what this layer can actually take.
         #
@@ -388,15 +473,22 @@ class Model:
                         not a property of spikes.
 
         Requires TF. Without it you get an honest error, not a silent no-op.
+
+        WARNING: a freshly built model is SILENT -- potentials stay below the
+        default threshold, so nothing spikes and no gradient flows. You MUST
+        call `axtf.build.calibrate_model(km, x, target_rate=...)` (or
+        `layer.calibrate(...)`) before training, otherwise loss saturates at
+        ln(num_classes). Calibration is not optional and is not performed
+        automatically, because it needs sample data `keras_model` does not have.
         """
         if not _HAS_TF:
             raise RuntimeError(
                 "TensorFlow is not installed. axtf is the only layer "
                 f"that needs it: {_TF_ERR}\n"
                 "axplan (memory, planner, explain) works without TF.")
-        from axtf.build import build_keras
-        return build_keras(self, inputs=inputs, outputs=outputs,
-                           compile_model=compile_model, readout=readout)
+        be = self._resolve_backend("tensorflow")
+        return be.build_model(self, inputs=inputs, outputs=outputs,
+                              compile_model=compile_model, readout=readout)
 
     def __repr__(self):
         s = f"Model({len(self.layers)} layers)"
@@ -535,8 +627,33 @@ def explain_budget(model: Model, budget: Budget, batch: int = 32,
     A("    axon/gate.py           gradient = derivative of the smooth model")
     A("                          (rel 1e-8); 1/T normalisation; DP planner")
     A("                          optimal vs exhaustive search; calibration")
-    A("    tests/run_all.py       18 suites: memory model, credit rules, TF")
-    A("                          kernel, Keras assembly, API audit, kernels")
+    # The count is read out of the gate's own table at run time. It used to be
+    # the literal "18 suites" here while the gate ran 28, and then 31: the
+    # number went stale twice because a human typed it once and nobody had a
+    # reason to touch this line again.
+    #
+    # It is parsed rather than imported on purpose. `import tests.run_all`
+    # resolves against whatever `tests` package happens to be on sys.path
+    # first -- on this machine that is an unrelated installed package, and
+    # the import walks into torch. tests/ is not a package and should not
+    # become one. ast.parse reads the literal without executing anything.
+    # This block reports how the claims were verified, which is a property of
+    # the *source tree*, not of the installed wheel -- the wheel deliberately
+    # ships no tests/ or examples/, and the sdist that does carry them does not
+    # install alongside it. So a wheel-installed `axiomrnn-explain` says the
+    # commands are in the sdist and stops there, rather than quoting a count it
+    # cannot read.
+    _n = _gate_suite_count()
+    if _n is None:
+        A("    tests/run_all.py       the gate: memory model, credit rules,")
+        A("                          TF kernel, Keras assembly, API audit,")
+        A("                          every example. Not shipped in the wheel;")
+        A("                          it travels in the sdist. See")
+        A("                          https://github.com/cubetitled-ui/axiomrnn")
+    else:
+        A(f"    tests/run_all.py       {_n} suites: memory model, credit")
+        A("                          rules, TF kernel, Keras assembly,")
+        A("                          API audit, kernels, every example")
     A("    examples/04            spiking vs dense, honest comparison")
     A("                          => PARITY, never superiority. The readout,")
     A("                          not the spikes, dominates the gap.")
@@ -577,7 +694,7 @@ def gate_report() -> tuple[bool, str]:
     here = os.path.dirname(os.path.abspath(__file__))
     r = subprocess.run(
         ["python3", "-W", "ignore", os.path.join(here, "axon", "gate.py")],
-        capture_output=True, text=True, timeout=1200)
+        capture_output=True, text=True, timeout=1200, check=False)
     return r.returncode == 0, r.stdout + r.stderr
 
 
@@ -625,7 +742,11 @@ def main_explain(argv=None) -> int:
         m.add_spiking(a.width, horizon=a.horizon)
     m.add_dense(a.classes)
 
-    print(m.explain(pick(), batch=a.batch))
+    # verbose=False, because explain_budget prints by default AND returns the
+    # same report. `print(m.explain(...))` therefore printed the whole 81-line
+    # report twice, identically: a 162-line file in which the reader has to
+    # work out that the second half is a copy. Print the returned value once.
+    print(m.explain(pick(), batch=a.batch, verbose=False))
 
     if a.gate:
         ok, out = gate_report()
@@ -639,3 +760,91 @@ def main_explain(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main_explain())
+
+# ═══ INFERENCE HELPER ════════════════════════════════════════════════════
+
+def generate(model, tok, seed, n: int = 20, context: int = 6,
+            temperature: float = 0.0):
+    """Greedy/temperature autoregressive generation with a single model call.
+
+    `model` is a compiled-or-not Keras model (the one returned by
+    `build_keras` / `Model.keras_model`). `tok` is a tokenizer exposing
+    `encode(list[str]) -> list[int]` and `decode(list[int]) -> list[str]`
+    (the shape used by `examples/05_t9.py` and `examples/07_generate.py`).
+
+    `seed` may be a string, a list of words, or a list of token ids.
+
+    IMPORTANT: this calls the model directly (`model(x)`) instead of
+    `model.predict(...)`. The model is run with `run_eagerly=True` (see
+    `axtf`), so each step executes a Python loop over time; generation is
+    therefore slow by construction and this function does not hide that. Do
+    not quote its throughput as a benchmark -- use
+    `examples/bench_inference.py` for honest numbers.
+    """
+    import numpy as np
+
+    # Normalise the seed into a list of token ids.
+    if isinstance(seed, str):
+        pieces = seed.split()
+    elif isinstance(seed, (list, tuple)):
+        pieces = list(seed)
+    else:
+        pieces = [seed]
+
+    if pieces and all(isinstance(p, (int, np.integer)) and not isinstance(p, bool)
+                      for p in pieces):
+        ids = [int(p) for p in pieces]
+    else:
+        ids = list(tok.encode([str(p) for p in pieces]))
+
+    if not ids:
+        ids = [0]
+
+    out_words = []
+    for _ in range(int(n)):
+        window = ids[-int(context):]
+        if len(window) < int(context):
+            window = [0] * (int(context) - len(window)) + window
+        x = np.asarray([window], dtype="int32")
+        logits = model(x, training=False)
+        logits = np.asarray(logits)
+        # logits is (batch, vocab) for a single-step model; if it is
+        # (batch, time, vocab) take the last time step.
+        if logits.ndim == 3:
+            logits = logits[:, -1, :]
+        logits = logits[0]
+
+        if temperature is None or temperature <= 0:
+            nxt = int(np.argmax(logits))
+        else:
+            scaled = logits / float(temperature)
+            scaled = scaled - np.max(scaled)
+            p = np.exp(scaled)
+            s = p.sum()
+            if not np.isfinite(s) or s <= 0:
+                nxt = int(np.argmax(logits))
+            else:
+                p = p / s
+                nxt = int(np.random.choice(len(p), p=p))
+
+        ids.append(nxt)
+        decoded = tok.decode([nxt])
+        word = decoded[0] if (isinstance(decoded, (list, tuple)) and decoded) else str(nxt)
+        out_words.append(word)
+
+    return " ".join(out_words)
+
+
+# Alias kept for callers that use the longer name.
+generate_text = generate
+
+
+# keep exports in sync
+try:
+    __all__  # noqa: B018
+except NameError:
+    __all__ = []
+if "generate" not in __all__:
+    __all__.append("generate")
+if "generate_text" not in __all__:
+    __all__.append("generate_text")

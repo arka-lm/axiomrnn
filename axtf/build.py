@@ -29,11 +29,14 @@ fundamentally do not do.
 """
 from __future__ import annotations
 
-import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
 from .cells import SpikingCell, SpikingRNNCell
+
+
+class _BuildError(ValueError, TypeError):
+    """Raised when build_keras cannot assemble a model."""
 
 
 class _Readout(keras.layers.Layer):
@@ -91,8 +94,18 @@ def build_keras(spec, inputs=None, outputs=None, compile_model=False,
     inputs    : keras.Input, or None -> (None, None)
     outputs   : number of classes; None -> no output layer
     readout   : 'flatten' (default, measured better) or 'mean'
+
+    WARNING: a freshly built model is silent until calibrated. Call
+    calibrate_model(model, x, ...) before training, or no gradient flows.
     """
     from axiomrnn import Dense, SpikingRNN
+
+    spiking_layers = [l for l in spec.layers if isinstance(l, SpikingRNN)]
+    if outputs is not None and not spiking_layers:
+        raise _BuildError(
+            "build_keras: `outputs` was given but the model has no spiking "
+            "layers. Add at least one SpikingRNN layer before attaching an "
+            "output head, or pass outputs=None.")
 
     if inputs is None:
         inputs = keras.Input(shape=(None, None), name="input")
@@ -140,7 +153,7 @@ def build_keras(spec, inputs=None, outputs=None, compile_model=False,
         m.compile(optimizer="adam",
                   loss=keras.losses.SparseCategoricalCrossentropy(
                       from_logits=True),
-                  metrics=["accuracy"], run_eagerly=True)
+                  metrics=["accuracy"], run_eagerly=False)
     return m
 
 
@@ -181,7 +194,7 @@ def _is_spiking(layer) -> bool:
 
 
 def calibrate_model(model: keras.Model, x, target_rate: float = 0.25,
-                    iters: int = 8):
+                    iters: int = 8, verbose: bool = False):
     """Pick a firing rate, then set thresholds so the net actually hits it.
 
     A fresh net is silent: potentials stay below the default threshold of
@@ -200,6 +213,11 @@ def calibrate_model(model: keras.Model, x, target_rate: float = 0.25,
         layer.calibrate(inp, target_rate=target_rate, iters=iters)
         fr, dead = layer.firing_rate(inp)
         out.append((layer.name, fr, dead))
+        if verbose:
+            print(f"  calibrate: {layer.name}: firing_rate={fr:.4f} "
+                  f"dead={dead:.4f} (target {target_rate:.2f})")
+    if verbose and not spiking:
+        print("  calibrate: no spiking layers found")
     return out
 
 
@@ -214,6 +232,6 @@ def measure_model(model: keras.Model, x):
     rows = []
     for layer, inp in zip(spiking, per_layer):
         fr, dead = layer.firing_rate(inp)
-        rows.append(dict(layer=layer.name, firing=round(fr, 4),
-                         dead=round(dead, 4)))
+        rows.append({"layer": layer.name, "firing": round(fr, 4),
+                 "dead": round(dead, 4)})
     return rows

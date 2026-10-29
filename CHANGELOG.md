@@ -2,6 +2,172 @@
 
 All notable changes. Dates are ISO.
 
+## [0.2.0] — 2026-10-29
+
+### Added
+
+- **Backend abstraction** (`backends/`): `Backend` ABC with `TensorFlowBackend`
+  and a `TorchBackend` skeleton; `Model(backend=...)`, `Model.build()`,
+  `get_backend()`. The TF backend delegates to the existing `axtf`; the torch
+  backend is a documented stub. `axiomrnn` still imports with numpy only.
+- **`generate` / `generate_text`**: greedy (and temperature-based) text
+  generation helper using direct model calls; replaces `model.predict` loops.
+
+### Changed
+
+- **`SpikingRNNCell` forward/backward now run under `tf.while_loop`** (via
+  `tf.TensorArray`). The Python time loop is gone; `run_eagerly` is no longer
+  required for the spiking layer. The threshold-gradient shape fix
+  (`dthr` as `(units,)`) enables learnable thresholds.
+
+### Fixed
+
+- ruff lint clean across `axiomrnn.py`, `axon/`, `axplan/`, `axtf/`, `backends/`,
+  `tests/`.
+
+### Numbers
+
+- Full gate (`tests/run_all.py`) green after the changes.
+
+## [Unreleased] — 2026-10-04
+
+The published **0.1.1 is defective**. Both planner bugs below return plausible
+numbers rather than raising, so they were invisible to every consumer. They
+were found by writing a test for the memory model that did not already exist,
+and both are now pinned by regression checks. Anyone who installed 0.1.1 should
+read this before trusting a credit-rule figure.
+
+### Fixed
+
+- **`credit_rule="local"` was answered with BPTT arithmetic.**
+  `axplan/memory.py` passed the bare string `"local"` into `credit_bytes()`,
+  which dispatched on `is CreditRule.LOCAL`. `CreditRule` is a `str`-Enum, so
+  the string *equals* the member but is never *identical* to it, the test
+  failed, and execution fell through to the BPTT branch. The local rule
+  reported `depends_on_T=True` and `quality_kept=1.0` — the exact opposite of
+  what `axplan/credit.py` documents — and `analyse()` charged BPTT bytes for a
+  local-rule request. `credit_bytes()` now normalises `rule` and `neuron`
+  through their enums, so a string and its member are the same request and an
+  unknown value raises instead of silently becoming BPTT.
+
+  Reproduced against the published artifact, installed from the PyPI wheel into
+  a clean venv:
+
+  ```
+  $ pip install --no-deps axiomrnn==0.1.1     # the file as uploaded
+  >>> credit_bytes("local", NeuronModel.LIF, 10**9, 500, 8, 1024, 8)
+  depends_on_T = True     # documented: False, "T-INDEPENDENT"
+  quality_kept = 1.0      # documented: 0.389 at T=500
+  ```
+
+  and after the fix, same call from a wheel built off this tree:
+
+  ```
+  depends_on_T = False
+  quality_kept = 0.389
+  ```
+- **Peak memory was capped at the credit horizon.** `backward_bytes()` truncated
+  the BPTT tape at `CreditModel.horizon()`, so `analyse()` returned an identical
+  peak for `T=100` and `T=400`. Reproduced against the published 0.1.1 wheel:
+
+  ```
+  BPTT tape T=100 : 294,801,408 B  (0.2746 GiB)
+  BPTT tape T=400 : 294,801,408 B  (0.2746 GiB)   identical
+  ```
+
+  Four times the horizon charged at the same price. After the fix, from a wheel
+  built off this tree: `446,668,800 B` at `T=100` and `1,786,675,200 B` at
+  `T=400` — exactly 4x. Two thirds of the horizon was free, which is the one
+  thing a memory planner must never do, and it contradicted the `credit_rule`
+  field's own documentation of BPTT as `Theta(T*A)`. The credit horizon still
+  sets `MemoryPlan.credit_horizon`, which is a statement about credit rather
+  than about tape length. Retraction: the "1B connections fit in 5 GiB" figure
+  that the old test asserted held only because of this bug — measured now, 1B
+  at `T=1000` costs 10.23 GiB under BPTT and 5.96 GiB under the local rule, and
+  neither fits. No published document quoted it.
+- **Every `project.urls` entry named a third party's repository.** The published
+  0.1.1 `METADATA` reads
+  `Source: https://github.com/timatigoogl3-code/axiomrnn` while `git remote`
+  says `cubetitled-ui`. `timatigoogl3-code` is the account this environment's
+  `gh` is authenticated as, not the author's. Corrected in `pyproject.toml` and
+  verified against the rebuilt wheel's `METADATA`, and `tests/test_api_surface.py`
+  now reads the URLs, the remote, the LICENSE and the classifiers so it cannot
+  drift again — sabotage-verified: reinstating the old URLs and the 3.14
+  classifier turns 9 checks red.
+- **The wheel advertised Python 3.14 while refusing to install on it.**
+  `requires-python = ">=3.10,<3.14"` with a
+  `Programming Language :: Python :: 3.14` classifier. The classifier is the
+  one a reader sees first.
+- **`ADV 02` skipped on every machine.** Registered as needing TensorFlow while
+  still naming plain `python3` as its interpreter, which on this machine is
+  3.14 and has no TensorFlow wheel. Separately, the gate's availability guard
+  used `os.path.exists("python3")`, which is always false for a bare command
+  name resolved through `PATH`, so "is this interpreter runnable" and "is
+  TensorFlow available" were the same question. They are now separate.
+
+### Added
+
+- **`tests/test_memory.py`** — 101 checks against the shipped `axplan.memory`.
+  It replaces a gate entry that ran `../verify/test_cost.py`: a file outside the
+  repository, absent from the wheel and the sdist, which began with
+  `sys.path.insert(0, '/home/cune')` and imported `axon.cost` from
+  `/home/cune/axon/cost.py`. Its green checks therefore certified a module no
+  installation contains, and on a fresh clone — including every GitHub runner —
+  the suite could not run at all. It also tested a stale predecessor of
+  `axplan/memory.py`, which is how both planner defects above survived.
+  The suite prints two `DIVERGENCE` lines it deliberately does **not** assert:
+  the `0.6`/`0.25` regime constants were fitted before `backward_bytes` entered
+  `activation_fraction`, so both cases cited in the module docstring now
+  classify differently.
+- **`AX_TF_PY`** — names the interpreter the gate should test TensorFlow with.
+  Without it the gate discovers candidates but cannot reach a venv it does not
+  know about, and reports SKIP rather than guessing.
+- **`BudgetSpec` refuses what it cannot price**: an unknown `credit_rule` or
+  `neuron_model`, `spike_rate <= 0`, `timesteps < 1`. Each previously returned a
+  confident number for a request that did not mean anything.
+
+- **Rules 21–24 in `docs/UX_RULES.md`**, one per defect above: a test must
+  exercise the code that ships; a value compared by identity is not a value; a
+  cap that is not a decision is an undercount; a published claim must survive
+  its own first reader.
+
+### Changed
+
+- `axplan/memory.py` docstring no longer quotes `96.0% vs 96.5% in ICLR'26` or
+  a test count. Both figures described the forward-tape-only model that
+  `axon/cost.py` implemented, which is not the code in this file.
+- The gate reports its own suite count, read from `tests/run_all.py` at run
+  time instead of a literal in `axiomrnn.py`. That literal said 18 while the
+  gate ran 28, then 31.
+- README no longer says the package is unpublished. It is on PyPI as 0.1.0 and
+  0.1.1, uploaded 2026-10-04, and the page now states plainly that the
+  installed version carries the two planner defects above.
+
+### Numbers that moved, and why
+
+The BPTT cap was an undercount, so **every published peak is now larger**. If
+you have a number from an earlier copy of the docs, it is an underestimate:
+
+| figure | was | is |
+|---|---:|---:|
+| `02_budget.py`, width 1024, `T=256` | 0.78 GiB | **1.57 GiB** |
+| `02_budget.py`, width 12288 | 4.38 GiB | **13.84 GiB** |
+| width at which a 6 GB card stops fitting | 20480 | **12288** |
+| `1B connections at T=1000`, BPTT | "fits in 5 GiB" | **10.23 GiB** |
+| `1B connections at T=1000`, local rule | not quoted | **5.96 GiB** |
+
+`README.md`, `docs/GETTING_STARTED.md` and `examples/README.md` were re-measured
+after the fix. The suite timings in the README were re-measured too and are now
+quoted as ranges over repeated runs, because the machine was under varying load
+and a single sample was not the honest form.
+
+## [0.1.1] — 2026-10-04
+
+Uploaded to PyPI at 11:54:53Z. Caps `requires-python` at `<3.14` (TensorFlow has
+no 3.14 wheel outside a release candidate) and stops the gate reporting a pass
+when a suite did not run. **Contains the two planner defects listed under
+Unreleased above.**
+
 ## [0.1.0] — 2026-10-02
 
 First public release. Everything below was found by measurement, and

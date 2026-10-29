@@ -12,7 +12,9 @@ that first.
 ## Install
 
 ```bash
-# There is no PyPI release. `pip install axiomrnn` does not work.
+# `pip install axiomrnn` works and gets you 0.1.1 -- which carries two
+# planner defects that return wrong numbers silently. Read the Install
+# section of README.md before trusting a credit-rule figure from it.
 git clone <this repository>
 cd axiomrnn
 ```
@@ -62,8 +64,8 @@ You get, among other things:
 ```
   WHAT IT COSTS IN MEMORY
     regime:        activation
-    tape share:    98.6% <-- tape dominates
-    peak:          0.78 GiB of 6 GiB
+    tape share:    99.6% <-- tape dominates
+    peak:          1.57 GiB of 6 GiB
 
   THE MAIN MEMORY LEVER: THE CREDIT RULE
     now: BPTT, 0.063 GiB
@@ -72,9 +74,9 @@ You get, among other things:
     -> at batch=32 the local rule is ALREADY cheaper.
 ```
 
-`MEASURED` — `python3 examples/02_budget.py`, exit 0 in 0.04 s on Python
-3.14.4 with no TensorFlow installed. That is arithmetic. Nothing imported
-TensorFlow to produce it.
+`MEASURED` 2026-10-04 — `python3 examples/02_budget.py`, exit 0 in 0.21–0.50 s
+over three runs, 16.6 MB peak RSS, on Python 3.14.4 with no TensorFlow
+installed. That is arithmetic. Nothing imported TensorFlow to produce it.
 
 ## 1b. The other direction: what should you build?
 
@@ -206,8 +208,18 @@ stay *verified*.
 python3 tests/run_all.py
 ```
 
-`MEASURED` — 2026-10-04, exit 0, 21 min 12 s wall clock, **28 suites**,
-**269 declared checks** across the seven suites that report a count.
+`MEASURED` — 2026-10-04 21:38 MSK, exit 0, **11 min 24 s** of suite time,
+**31 suites**, all of them run, **385 declared checks** across the nine suites
+that report a count.
+
+If the gate cannot find an interpreter with TensorFlow — the normal case, since
+it is usually a project venv rather than `./.venv` — it reports every
+TensorFlow suite as SKIPPED and exits 2. That is the honest answer. Point it at
+the right one:
+
+```bash
+AX_TF_PY=/path/to/python-with-tensorflow python3 tests/run_all.py
+```
 
 The gate compares the analytic gradient against finite differences on the
 *smoothed* model — the live run reports `median rel.err 1.02e-08, worst
@@ -217,11 +229,14 @@ It is not ceremony: it is what caught a `norm_t` parameter that had been
 threaded through four signatures and never applied, and a backward pass that
 read `cell.leak` as a membrane derivative.
 
-Two limits of the gate, so you read it correctly: nineteen of the twenty
-examples are suites and prove only that the process exited 0, because
-`tests/run_all.py:150-154` filters their output away; and
-`examples/04_equal_budget.py` — the spiking-versus-dense comparison — is not a
-suite at all.
+Two limits of the gate, so you read it correctly. Twenty-two of the thirty-one
+suites prove only that the process exited 0, because the gate filters their
+output down to lines matching `PASS`/`ok]`/`Error`/`Traceback`/`SKIPPED`; the
+other nine report a count, and 14 suites now declare evidence markers, so a run
+that exits 0 without printing what it claims to show is a FAIL. And the gate
+covers **every** example now — `examples/04_equal_budget.py` used to be the
+exception, which is why a comment claiming otherwise could sit in the source
+unnoticed.
 
 ## Where to go next
 

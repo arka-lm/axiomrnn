@@ -49,7 +49,7 @@ evidence that e-prop scales to 1B.
 """
 from __future__ import annotations
 
-import math
+import itertools
 from dataclasses import dataclass
 from enum import Enum
 
@@ -119,8 +119,8 @@ class CreditPlan:
         dep = "depends on T" if self.depends_on_T else "T-independent"
         s = [f"credit rule:     {self.rule.value} ({dep})",
              f"neuron:          {self.neuron.value}",
-             f"state:           {self.bytes_total:,} B "
-             f"({self.bytes_per_synapse} B/synapse)"]
+             (f"state:           {self.bytes_total:,} B "
+              f"({self.bytes_per_synapse} B/synapse)")]
         if self.quality_kept is not None:
             s.append(f"quality:         {self.quality_kept:.1%} "
                      f"of full BPTT")
@@ -139,7 +139,22 @@ def credit_bytes(rule: CreditRule, neuron: NeuronModel, connections: int,
     LOCAL: fp32 trace per synapse, independent of T. Here we do NOT multiply
            by batch: the trace accumulates across the batch WITHIN a step,
            it is not stored per example.
+
+    `rule` and `neuron` are normalised through their enums before anything
+    else. This is not tidiness. The dispatch below used to be `is
+    CreditRule.LOCAL`, and because CreditRule is a str-Enum a caller passing
+    the plain string 'local' -- which axplan.memory.backward_bytes did, via
+    the module-level `_LOCAL = 'local'` -- failed the identity test and fell
+    through to the BPTT branch. The local rule then reported
+    depends_on_T=True and quality_kept=1.0, the exact opposite of what this
+    module documents, and no caller could tell: the answer was a plausible
+    number, not an error. Normalising first makes a string and its enum
+    member the same request, and makes an unknown rule raise instead of
+    silently becoming BPTT.
     """
+    rule = CreditRule(rule)
+    neuron = NeuronModel(neuron)
+
     if rule is CreditRule.LOCAL:
         per_syn = TRACE_BYTES[neuron]
         return CreditPlan(
@@ -176,12 +191,12 @@ def local_quality(timesteps: int) -> float | None:
     Returning None means "unknown", and the caller must surface that.
     """
     ts = sorted(FPTT_ACCURACY)
-    lo, hi = ts[0], ts[-1]
+    hi = ts[-1]
     if timesteps > hi:
         return None                      # no data
     if timesteps < 20:
         return 1.0                       # short sequences
-    for a, b in zip(ts, ts[1:]):
+    for a, b in itertools.pairwise(ts):
         if a <= timesteps <= b:
             qa, qb = FPTT_ACCURACY[a], FPTT_ACCURACY[b]
             return qa + (qb - qa) * (timesteps - a) / (b - a)
